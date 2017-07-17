@@ -16,8 +16,6 @@ This repository contains Python 2.7 scripts for unpacking firmware regions for M
 
   No progress output. Don't worry - just wait
 
-  Huffman tables are incompete [yet]. unME11 would crash on unknown Huffman sequences (it is expected behaviour ;)
-
 ## Related URLs:
 
 [Intel ME: The Way of the Static Analysis][2]

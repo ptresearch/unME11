@@ -69,7 +69,6 @@ class HuffDecoder(object):
       if v is None: continue
       assert len(v) == cb
       d[cw] = v # Remember value
-      if v in sv: raise Error("Value %s already present" % v.encode("hex"))
       sv.add(v)
 
     self.adTab.append(d)
