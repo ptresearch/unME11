@@ -1,13 +1,21 @@
-import os, sys, struct, hashlib
+#!/usr/bin/env python
+import os, sys, struct, hashlib, platform
 import subprocess
 
 try:
   import HuffDec11
-  HuffDecoder = HuffDec11.HuffDecoder()
+  HuffDecoder11 = HuffDec11.HuffDecoder()
 except:
-  HuffDecoder = None
+  HuffDecoder11 = None
+
+try:
+  import HuffDec12
+  HuffDecoder12 = HuffDec12.HuffDecoder()
+except:
+  HuffDecoder12 = None
 
 class Globals(object):
+  HuffDecoder = HuffDecoder11
   dumpManifest = True # Dump CPD manifest
   dumpMeta = True # Dump modules metadata
   dumpRaw = False # Dump raw modules data (compressed/encrypted)
@@ -30,6 +38,9 @@ class StructReader(object):
     self.o = self.base
     self.cE = "<" if isLE else ">"
 
+  def sizeLeft(self):
+    return len(self.ab) - self.o
+
   def getData(self, o, cb):
     o += self.base
     if o < len(self.ab) and cb >= 0 and o + cb <= len(self.ab):
@@ -46,10 +57,10 @@ class StructReader(object):
         expected = fldDef[2]
         if isinstance(expected, (list, tuple)):
           if not val in expected:
-            print >>sys.stderr, "%s.%s: not %s in %s" % (obj.__class__.__name__, name, val, expected)
+            print >>sys.stderr, "- %s.%s: not %s in %s" % (obj.__class__.__name__, name, val, expected)
         else:
           if val != expected:
-            print >>sys.stderr, "%s.%s:" % (obj.__class__.__name__, name),
+            print >>sys.stderr, "- %s.%s:" % (obj.__class__.__name__, name),
             if isinstance(val, str): print >>sys.stderr, "Got %s, expected %s" % (val.encode("hex"), expected.encode("hex"))
             else: print >>sys.stderr, "Got [%s], expected [%s]" % (repr(val), repr(expected))
           else: assert val == expected
@@ -75,8 +86,14 @@ aPubKeyHash = [v.decode("hex") for v in (
 #***************************************************************************
 #***************************************************************************
 
+args_lzma = {
+  "Windows": ["lzma", "d", "-si", "-so"],
+  "Linux":   ["lzma", "-d"],
+  "Darwin":  ["lzma", "-d"], # "brew install xz" or "sudo port install xz"
+}[platform.system()]
+
 def LZMA_decompress(compdata):
-  process = subprocess.Popen(["lzma", "d", "-si", "-so"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  process = subprocess.Popen(args_lzma, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
   output, errout = process.communicate(compdata)
   retcode = process.poll()
   if retcode: raise Error(errout)
@@ -87,13 +104,13 @@ def decompress(data, compType, length):
     return data
   elif "lzma" == compType:
     if not data.startswith("36004000".decode("hex")):
-      print >>sys.stderr, "Bad LZMA[0x%X] header %s" % (len(data), data[:17].encode("hex"))
+      print >>sys.stderr, "- Bad LZMA[0x%X] header %s" % (len(data), data[:17].encode("hex"))
       return None
     assert data.startswith("36004000".decode("hex"))
     assert '\0\0\0' == data[14:17]
     return LZMA_decompress(data[:14] + data[17:])
   elif "huff" == compType:
-    return HuffDecoder.decompress(data, length) if HuffDecoder else None
+    return g.HuffDecoder.decompress(data, length) if g.HuffDecoder else None
   else:
     raise Error("Invalid compType %s" % compType)
 
@@ -106,6 +123,7 @@ RESTART_ON_NEXT_BOOT = 2
 PROCESS_TYPE		= 0
 SHARED_LIBRARY_TYPE	= 1
 DATA_TYPE		= 2
+IUNIT_TYPE		= 3 # v12
 
 # PARTITION_TYPES
 FPT_AREATYPE_GENERIC	= 1
@@ -211,7 +229,11 @@ class Init_Script_Ext(Extension): # 1 : used in Mainfist
   def __init__(self, ab):
     stR = StructReader(ab)
     stR.read(self, self.INIT_SCRIPT)
-    self.LoadItems(stR, Init_Script_Entry, self.number_of_modules)
+
+    clsSize, remainder = divmod(stR.sizeLeft(), self.number_of_modules)
+    if remainder: raise Error("Init_Script_Ext data size == %d is not miltiple of nItems == %d" % stR.sizeLeft(), self.number_of_modules)
+    cls = {24: Init_Script_Entry, 28: Init_Script_Entry_v12}[clsSize]
+    self.LoadItems(stR, cls, self.number_of_modules)
 
   def dump(self, flog=sys.stdout):
     print >>flog, self.Banner()
@@ -227,6 +249,7 @@ class Init_Script_Entry:
     ("bf_boot_type",		"L",	),		# Boot path flag bits to indicate which boot path(s) this module is applicable to. Bit 0 - Normal Bit 1 - HAP Bit 2 - HMRFPO Bit 3 - Temp Disable Bit 4 - Recovery Bit 5 - Safe Mode Bit 6 - FW Update Bits 7:31 - Reserved
   )
   def __init__(self, stR):
+    self.unk = None
     stR.read(self, self.INIT_SCRIPT_ENTRY)
     self.partition_name = self.partition_name.rstrip('\0')
     self.name = self.name.rstrip('\0')
@@ -235,6 +258,26 @@ class Init_Script_Entry:
 
   def __str__(self):
     return "%4s:%-12s Init: %08X (%s) Boot: %08X (%s)" % (self.partition_name, self.name, self.bf_init_flags, self.init_flags, self.bf_boot_type, self.boot_type)
+
+#***************************************************************************
+
+class Init_Script_Entry_v12:
+  INIT_SCRIPT_ENTRY = (
+    ("partition_name",		"4s",	),		# Manifest Partition Name. This field identifies the manifest in which this module's hash will be found irregardles of manifest's physical location (i.e. FTP manifest may be physically located in NFTP flash partition during FW update).
+    ("name",			"12s",	),		# Module Name
+    ("bf_init_flags",		"L",	),		# Flags used govern initialization flow.
+    ("bf_boot_type",		"L",	),		# Boot path flag bits to indicate which boot path(s) this module is applicable to. Bit 0 - Normal Bit 1 - HAP Bit 2 - HMRFPO Bit 3 - Temp Disable Bit 4 - Recovery Bit 5 - Safe Mode Bit 6 - FW Update Bits 7:31 - Reserved
+    ("unk",			"L",	),		#
+  )
+  def __init__(self, stR):
+    stR.read(self, self.INIT_SCRIPT_ENTRY)
+    self.partition_name = self.partition_name.rstrip('\0')
+    self.name = self.name.rstrip('\0')
+    self.init_flags = Init_Script_Flags(self.bf_init_flags)
+    self.boot_type = Init_Script_Boot_Type(self.bf_boot_type)
+
+  def __str__(self):
+    return "%4s:%-12s Init: %08X (%s) Boot: %08X (%s) Unk: %X" % (self.partition_name, self.name, self.bf_init_flags, self.init_flags, self.bf_boot_type, self.boot_type, self.unk)
 
 #***************************************************************************
 
@@ -330,8 +373,8 @@ class Partition_Info_Ext(Extension): # 3 : used in Mainfist
     ("data_format_version",	"L",	),		#
     ("instance_id",		"L",	),		#
     ("flags",			"L",	),		# Support multiple instances Y/N. Used for independently updated partitions that may have multiple instances (such as WLAN uCode or Localization)
-    ("reserved",		"16s",	'\xFF'*16),	# set to 0xff
-    ("unknown0",		"L",	(0, 3, 0xFFFFFFFF)),	# Was 0xffffffff
+    ("reserved",		"16s",	('\0'*16, '\xFF'*16,)),	# set to 0xff
+    ("unknown0",		"l",	(0, 1, 3, -1)),	# Was 0xffffffff
     # MANIFEST_MODULE_INFO_EXT[] # Module info extension entries
   )
   def __init__(self, ab):
@@ -350,6 +393,7 @@ class Partition_Info_Ext(Extension): # 3 : used in Mainfist
     print >>flog, "  Ver: %X, %X" % (self.partition_version, self.data_format_version)
     print >>flog, "  Instance ID: %d" % self.instance_id
     print >>flog, "  Flags: %d" % self.flags
+    print >>flog, "  Unknown: %d" % self.unknown0
     print >>flog, "  Modules[%d]:" % len(self.modules)
     self.PrintItems(flog)
 
@@ -360,12 +404,13 @@ class Module_Info:
     PROCESS_TYPE:        "Proc",	# 0
     SHARED_LIBRARY_TYPE: "Lib ",	# 1
     DATA_TYPE:           "Data",	# 2
+    IUNIT_TYPE:          "iUnt",	# 3 v12
   }
   MANIFEST_MODULE_INFO_EXT = (
     ("name",			"12s",	),		# Character array. If name length is shorter than field size the name is padded with 0 bytes
-    ("type",			"B",	(0,1,2)),	# 0 - Process 1; - Shared Library; 2 - Data
+    ("type",			"B",	(0,1,2,3)),	# 0 - Process; 1 - Shared Library; 2 - Data; 3 - iUnit
     ("reserved0",		"B",	),		#
-    ("reserved1",		"H",	0xFFFF),	# set to 0xffff
+    ("reserved1",		"H",	(0, 0xFFFF)),	# set to 0xffff
     ("metadata_size",		"L",	),		#
     ("metadata_hash",		"32s"	),		# For a process/shared library this is the SHA256 of the module metadata file; for a data module this is the SHA256 hash of the module binary itself
   )
@@ -708,7 +753,10 @@ class User_Info_Ext(Extension): # 13 : used in Manifest
   TYPE = 13 # for user info extension
   LIST = "users"
   def __init__(self, ab):
-    self.LoadItems(StructReader(ab), User_Info_Entry)
+    try:
+      self.LoadItems(StructReader(ab), User_Info_Entry)
+    except:
+      self.LoadItems(StructReader(ab), User_Info_Entry_new)
 
   def dump(self, flog=sys.stdout):
     print >>flog, self.Banner()
@@ -719,7 +767,7 @@ class User_Info_Ext(Extension): # 13 : used in Manifest
 class User_Info_Entry:
   USER_INFO_ENTRY = (
     ("user_id",			"H",	),		# User ID.
-    ("reserved",		"H",	0),		# Must be 0.
+    ("reserved",		"H",	(0,1)),		# Must be 0.
     ("non_volatile_storage_quota","L",	),		# Maximum size of non-volatile storage area.
     ("ram_storage_quota",	"L",	),		# Maximum size of RAM storage area.
     ("wop_quota",		"L",	),		# Quota to use in wear-out prevention algorithm; in most cases this should match the non-volatile storage quota; however it is possible to virtually add quota to a user to allow it to perform more write operations on expense of another user. At build time the build system will check that the sum of all users WOP quota is not more than the sum of all users non-volatile storage quota.
@@ -728,9 +776,26 @@ class User_Info_Entry:
   def __init__(self, stR):
     stR.read(self, self.USER_INFO_ENTRY)
     self.working_dir = self.working_dir.rstrip('\0')
+    assert self.working_dir.find('\0') < 0
 
   def __str__(self):
     return "user id:0x%04X, NV quota:%8X, RAM quota:%8X, WOP quota:%8X, working dir: [%s]" % (self.user_id, self.non_volatile_storage_quota, self.ram_storage_quota, self.wop_quota, self.working_dir)
+
+#***************************************************************************
+
+class User_Info_Entry_new:
+  USER_INFO_ENTRY = (
+    ("user_id",			"H",	),		# User ID.
+    ("reserved",		"H",	0),		# Must be 0.
+    ("non_volatile_storage_quota","L",	),		# Maximum size of non-volatile storage area.
+    ("ram_storage_quota",	"L",	),		# Maximum size of RAM storage area.
+    ("wop_quota",		"L",	),		# Quota to use in wear-out prevention algorithm; in most cases this should match the non-volatile storage quota; however it is possible to virtually add quota to a user to allow it to perform more write operations on expense of another user. At build time the build system will check that the sum of all users WOP quota is not more than the sum of all users non-volatile storage quota.
+  )
+  def __init__(self, stR):
+    stR.read(self, self.USER_INFO_ENTRY)
+
+  def __str__(self):
+    return "user id:0x%04X, NV quota:%8X, RAM quota:%8X, WOP quota:%8X" % (self.user_id, self.non_volatile_storage_quota, self.ram_storage_quota, self.wop_quota)
 
 #***************************************************************************
 #***************************************************************************
@@ -745,7 +810,8 @@ class Package_Info_Ext(Extension): # 15 : used in TXE Mainfist
     ("version_control_number",	"L",	),		# The version control number (VCN) is incremented whenever a change is made to the FW that makes it incompatible from an update perspective with previously released versions of the FW.
     ("usage_bitmap",		"16s",	),		# Bitmap of usages depicted by this manifest, indicating which key is used to sign the manifest
     ("svn",			"L",	),		# Secure Version Number
-    ("reserved",		"16s",	'\x00'*16),	# Must be 0
+    ("unknown",			"L",	),		#
+    ("reserved",		"12s",	'\x00'*12),	# Must be 0
     # SIGNED_PACKAGE_INFO_EXT_ENTRY[] # Module info extension entries
   )
   def __init__(self, ab):
@@ -760,6 +826,7 @@ class Package_Info_Ext(Extension): # 15 : used in TXE Mainfist
     print >>flog, "  VCN: %d" % self.version_control_number
     print >>flog, "  Usage Bitmap: %s" % self.usage_bitmap.encode("hex")
     print >>flog, "  svn: %d" % self.svn
+    print >>flog, "  unknown: 0x%X" % self.unknown
     print >>flog, "  Modules[%d]:" % len(self.modules)
     self.PrintItems(flog)
 
@@ -770,7 +837,7 @@ class Package_Info_Ext_Entry:
     PROCESS_TYPE:        "Proc",	# 0
     SHARED_LIBRARY_TYPE: "Lib ",	# 1
     DATA_TYPE:           "Data",	# 2
-    3:			 "TBD ",	# 3
+    IUNIT_TYPE:		 "iUnt",	# 3 v12
   }
   dHashAlgorithm = {
     1: "SHA1",
@@ -778,7 +845,7 @@ class Package_Info_Ext_Entry:
   }
   SIGNED_PACKAGE_INFO_EXT_ENTRY = (
     ("name",			"12s",	),		# Character array. If name length is shorter than field size the name is padded with 0 bytes
-    ("type",			"B",	(0,1,2,3)),	# 0 - Process 1; - Shared Library; 2 - Data; 3 - TBD
+    ("type",			"B",	(0,1,2,3)),	# 0 - Process; 1 - Shared Library; 2 - Data; 3 - iUnit
     ("hash_algorithm",		"B",	2),		# 0 - Reserved; 1 - SHA1; 2 - SHA256
     ("hash_size",		"H",	32),		# Size of Hash in bytes = N; BXT to support only SHA256. So N=32.
     ("metadata_size",		"L",	),		# Size of metadata file
@@ -791,6 +858,107 @@ class Package_Info_Ext_Entry:
 
   def __str__(self):
     return "%-4s, Meta cb:%4X h=%s[%d]:%s %s" % (self.dModType[self.type], self.metadata_size, self.dHashAlgorithm[self.hash_algorithm], self.hash_size, self.metadata_hash.encode("hex"), self.name)
+
+#***************************************************************************
+#***************************************************************************
+#***************************************************************************
+
+class Unk_16_Ext(Extension): # 16 : used in Manifest (for iUnit)
+  NAME = "Unk_iUnit_16"
+  TYPE = 16 # for iUnit extension
+  UNK_IUNIT_16_EXT = (
+    ("v0_1",			"L",	1),		#
+    ("unk16",			"16s",	'\0'*16),	#
+    ("v2_3",			"L",	3),		#
+    ("v3",			"L",	),		#
+    ("v4_1",			"L",	1),		#
+    ("h",			"32s",	),		#
+    ("reserved",		"24s",	'\0'*24),	#
+  )
+  def __init__(self, ab):
+    stR = StructReader(ab)
+    stR.read(self, self.UNK_IUNIT_16_EXT)
+#    self.h = self.h[::-1] # Reverse?
+    stR.done()
+
+  def dump(self, flog=sys.stdout):
+    print >>flog, self.Banner()
+    print >>flog, "  %X %X %X %X h=%s" % (self.v0_1, self.v2_3, self.v3, self.v4_1, self.h.encode("hex"))
+
+#***************************************************************************
+#***************************************************************************
+#***************************************************************************
+
+class Unk_18_Ext(Extension): # 18 : used in Manifest
+  NAME = "Unk_18"
+  TYPE = 18 # for user info extension
+  LIST = "records"
+  UNK_18_EXT = (
+    ("items",			"L",	),		#
+    ("unk",			"16s",	),		#
+  )
+  def __init__(self, ab):
+    stR = StructReader(ab)
+    stR.read(self, self.UNK_18_EXT)
+    self.LoadItems(stR, Unk_18_Ext_Entry)
+
+  def dump(self, flog=sys.stdout):
+    print >>flog, self.Banner()
+    print >>flog, "  Records[%d] %s:" % (self.items, self.unk.encode("hex"))
+    self.PrintItems(flog)
+
+#***************************************************************************
+
+class Unk_18_Ext_Entry:
+  UNK_18_EXT_ENTRY = (
+    ("ab",			"56s",	),		#
+  )
+  def __init__(self, stR):
+    stR.read(self, self.UNK_18_EXT_ENTRY)
+
+  def __str__(self):
+    return self.ab.encode("hex")
+
+#***************************************************************************
+#***************************************************************************
+#***************************************************************************
+
+class Unk_22_Ext(Extension): # 22 : used in Manifest (v12)
+  NAME = "Unk_22"
+  TYPE = 22 # for v12 extension
+  UNK_22_EXT = (
+    ("name",			"4s",	),		#
+    ("unk24",			"24s",	),		#
+    ("h",			"32s",	),		#
+    ("reserved",		"20s",	'\0'*20),	#
+  )
+  def __init__(self, ab):
+    stR = StructReader(ab)
+    stR.read(self, self.UNK_22_EXT)
+#    self.h = self.h[::-1] # Reverse?
+    stR.done()
+
+  def dump(self, flog=sys.stdout):
+    print >>flog, "%s [%s] u=%s h=%s" % (self.Banner(), self.name, self.unk24.encode("hex"), self.h.encode("hex"))
+
+#***************************************************************************
+#***************************************************************************
+#***************************************************************************
+
+class Unk_50_Ext(Extension): # 50 : used in Manifest (HP)
+  NAME = "Unk_50"
+  TYPE = 50 # for iUnit extension
+  UNK_50_EXT = (
+    ("name",			"4s",	),		#
+    ("dw0",			"L",	0),		#
+  )
+  def __init__(self, ab):
+    stR = StructReader(ab)
+    stR.read(self, self.UNK_50_EXT)
+    stR.done()
+
+  def dump(self, flog=sys.stdout):
+    print >>flog, "%s [%s]" % (self.Banner(), self.name)
 
 #***************************************************************************
 #***************************************************************************
@@ -811,8 +979,12 @@ aExtHandlers = (
   Locked_Ranges_Ext,		# 11
   Client_System_Info_Ext,	# 12
   User_Info_Ext,		# 13
-#  None,				# 14
+#  None,			# 14
   Package_Info_Ext,		# 15
+  Unk_16_Ext,			# 16
+  Unk_18_Ext,			# 18
+  Unk_22_Ext,			# 22
+  Unk_50_Ext,			# 50
 )
 
 dExtHandlers = {ext.TYPE: ext for ext in aExtHandlers}
@@ -825,15 +997,24 @@ def Ext_ParseAll(obj, ab, o=0):
       assert o+cb <= len(ab)
       yield tag, ab[o+8:o+cb]
       o += cb
+
+  obj.extList = []
   for extType, extData in EnumTags(ab, o):
     ext = dExtHandlers.get(extType, None)
-    if ext is not None: setattr(obj, ext.NAME, ext(extData))
+    if ext is not None:
+      extObj = ext(extData)
+      setattr(obj, ext.NAME, extObj)
+      obj.extList.append(extObj)
 #    else: raise Error("Extension #%d[%d] not supported" % (extType, len(extData)))
-    else: print "Unknown extType#%d[%d] %s" % (extType, len(extData), extData.encode("hex"))
+    else:
+      parent = obj.name + (".met" if isinstance(obj, CPD_Entry) else "")
+      print >>sys.stderr, "- %s: Unknown extType#%d[%d] %s" % (parent, extType, len(extData), extData.encode("hex"))
 
 def Ext_DumpAll(obj, flog=sys.stdout):
-  for ext in aExtHandlers:
-    if hasattr(obj, ext.NAME): getattr(obj, ext.NAME).dump(flog)
+  if hasattr(obj, "extList"):
+    for extObj in obj.extList: extObj.dump(flog)
+#  for ext in aExtHandlers:
+#    if hasattr(obj, ext.NAME): getattr(obj, ext.NAME).dump(flog)
 
 #***************************************************************************
 #***************************************************************************
@@ -866,12 +1047,15 @@ class CPD_Manifest:
     ("exponent",		"L",	),		# Exponent [== 17]
     ("signature",		"256s"	),		# RSA signature of manifest
   )
-  def __init__(self, ab):
+  def __init__(self, ab, name):
+    self.name = name
     self.stR = StructReader(ab)
     self.stR.read(self, self.MANIFEST_HEADER)
     self.stR.read(self, self.CRYPTO_BLOCK)
     assert 4*self.size == len(ab)
     Ext_ParseAll(self, ab, 4*self.length) # Parse all Extensions
+
+    if 12 == self.version_major: g.HuffDecoder = HuffDecoder12
 
   def dump(self, flog=sys.stdout):
     print >>flog, "CPD Manifest"
@@ -894,17 +1078,6 @@ class CPD_Manifest:
     expected = "\x00\x01" + "\xFF"*202 + "003031300D060960864801650304020105000420".decode("hex") + h
     print >>flog, "Exponent:%d, Verification:%s" % (self.exponent, "OK" if decoded == expected else "FAILED")
     Ext_DumpAll(self, flog) # Dump all extensions
-
-#***************************************************************************
-#***************************************************************************
-#***************************************************************************
-
-class CPD_Meta:
-  def __init__(self, ab):
-    Ext_ParseAll(self, ab) # Parse all Extensions
-
-  def dump(self, flog=sys.stdout):
-    Ext_DumpAll(self, flog) # Dump all Extensions
 
 #***************************************************************************
 #***************************************************************************
@@ -963,7 +1136,7 @@ class CPD: # Code Partition Directory
     self.d = {e.name:e for e in self.files} # Dict maps name CPD_Entry
 
     e = self.files[0] # Access Manifest (very first entry in lookup table)
-    self.Manifest = CPD_Manifest(e.getData()) if e.name.endswith(".man") else None
+    self.Manifest = CPD_Manifest(e.getData(), e.name) if e.name.endswith(".man") else None
 #    assert self.partition_name + ".man" == e.name
 
     self.modules = None
@@ -972,7 +1145,8 @@ class CPD: # Code Partition Directory
         self.modules = self.Manifest.PackageInfo.modules
       elif hasattr(self.Manifest, "PartitionInfo"):
         self.modules = self.Manifest.PartitionInfo.modules
-        assert len(self.files) == 1 + 2*len(self.modules) # Manfest + nFiles * (Data + Metadata)
+        if len(self.files) != 1 + 2*len(self.modules): # Manfest + nFiles * (Data + Metadata)
+          print >>sys.stderr, "- Partition holds %d files but only %d module[s] (%d expected)" % (len(self.files), len(self.modules), (len(self.files)-1)/2)
 
     if self.modules: # Try to attach Module Info and Metadata to Entry
       for i,mod in enumerate(self.modules): # Walk through modules listed in partion manifest
@@ -1028,7 +1202,7 @@ class CPD: # Code Partition Directory
         compType = dCompType[e.ModAttr.compression_type]
         data = e.getData()
         if e.ModAttr.encrypted:
-          print >>sys.stderr, "Module %s is encrypted" % e.name
+          print >>sys.stderr, "- Module %s is encrypted" % e.name
 
         if "huff" == compType:
           assert e.length == e.ModAttr.uncompressed_size
@@ -1044,9 +1218,10 @@ class CPD: # Code Partition Directory
 
         if plain:
           if not hashChecked:
-            assert hashlib.sha256(plain).digest() == e.ModAttr.image_hash
-#            print "%8s: plain" % e.name
-            hashChecked = True
+#            assert hashlib.sha256(plain).digest() == e.ModAttr.image_hash
+            if hashlib.sha256(plain).digest() == e.ModAttr.image_hash:
+              hashChecked = True
+#              print "%8s: plain" % e.name
 
           with open(os.path.join(baseDir, "%s.mod" % e.name), "wb") as fo: fo.write(plain)
         else:
@@ -1057,7 +1232,7 @@ class CPD: # Code Partition Directory
           else:
             with open(os.path.join(baseDir, "%s.%s" % (e.name, compType)), "wb") as fo:
               fo.write(data)
-        if not hashChecked: print "-hash %s: [%s]" % (e.name, compType)
+        if not hashChecked: print >>sys.stderr, "- hash %s.%s[%s]: %s" % (self.partition_name, e.name, compType, e.ModAttr.image_hash.encode("hex"))
 #    print
 
 #***************************************************************************
@@ -1224,7 +1399,6 @@ class ME11:
       self.fpt = None
 #      raise Error("FPT not found")
 
-
     o = 0
     self.CPDs = []
     while True: # Search for CPDs
@@ -1232,6 +1406,7 @@ class ME11:
       if o < 0: break
       if "\x01\x01\x10" == self.ab[o+8:o+11]:
 #        print "%s at %08X" % (CPD.MARKER, o)
+        print ". Processing CPD at 0x%X" % o
         self.CPDs.append(CPD(self.ab, o))
 #        try: except: pass
       o += 4
